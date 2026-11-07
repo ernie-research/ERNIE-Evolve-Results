@@ -1,6 +1,6 @@
 # NanoGPT speedrun, track 1: 38.92 s
 
-18 unseeded runs of this code, torch `2.10.0+cu128`. All runs count.
+18 unseeded runs of this code on 8×H100-80GB (one node), torch `2.10.0+cu128`. All runs count.
 
 | runs | train_time | final val loss | runs > 3.28 |
 |---|---|---|---|
@@ -13,7 +13,7 @@ log has been replaced by a one-line summary.
 
 ## Reproduce
 
-Needs 8 GPUs on one node, NVIDIA driver >= 580, and a CUDA 13 runtime (the FA3 attention kernel links
+Needs 8×H100-80GB on one node (the track's hardware), NVIDIA driver >= 580, and a CUDA 13 runtime (the FA3 attention kernel links
 `libcudart.so.13`). `CUDA_HOME` must point at a CUDA toolkit with `include/cuda_bf16.h`; the cross-entropy
 kernel is compiled with nvrtc at import.
 

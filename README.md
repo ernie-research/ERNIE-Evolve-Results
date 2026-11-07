@@ -9,7 +9,7 @@ runs that measured it.
 | task | result | directory |
 |---|---|---|
 | nanochat autoresearch: 300 s training budget on one GPU, minimize val_bpb | val_bpb **0.8763** | [`nanochat-autoresearch/`](nanochat-autoresearch/) |
-| NanoGPT speedrun track 1: reach 3.28 FineWeb val loss, minimize training time | **38.92 s** (n=18) | [`nanogpt-speedrun/track-1/`](nanogpt-speedrun/track-1/) |
+| NanoGPT speedrun track 1: reach 3.28 FineWeb val loss on 8×H100, minimize training time | **38.92 s** (n=18) | [`nanogpt-speedrun/track-1/`](nanogpt-speedrun/track-1/) |
 | NanoGPT speedrun track 3: reach 3.28 FineWeb val loss with fixed data and architecture, minimize steps | **2590 steps** (n=8) | [`nanogpt-speedrun/track-3/`](nanogpt-speedrun/track-3/) |
 
 Each directory's README has the full numbers, the method and the run details. In every log, the code
@@ -28,7 +28,7 @@ PYTHON=python3.12 INSTALL=1 GPU=0 bash launch.sh   # installs pinned packages, p
 
 ### NanoGPT speedrun, track 1
 
-Eight GPUs on one node, driver ≥ 580, CUDA 13 runtime, `CUDA_HOME` set to a CUDA toolkit.
+8×H100-80GB on one node (the track's hardware), driver ≥ 580, CUDA 13 runtime, `CUDA_HOME` set to a CUDA toolkit.
 
 ```bash
 cd nanogpt-speedrun/track-1
