@@ -1,0 +1,635 @@
+"""
+train_gpt_simple.py
+
+This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
+It was prepared as a simplified version of the speedrun for use in neural net optimization research.
+"""
+
+import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read() # read the code of this file ASAP, for logging
+import uuid
+import math
+import time
+from pathlib import Path
+
+import torch
+from torch import Tensor, nn
+from torch.optim import AdamW
+import torch.nn.functional as F
+import torch.distributed as dist
+
+
+########################################
+#              Dataloader              #
+########################################
+
+def _load_data_shard(file: Path):
+    header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2]) # number of tokens (claimed)
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+    return tokens
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
+    files = sorted(Path.cwd().glob(filename_pattern))
+    assert batch_size % dist.get_world_size() == 0
+    local_batch_size = batch_size // dist.get_world_size()
+    file_iter = iter(files)
+    tokens, pos = _load_data_shard(next(file_iter)), 0
+    while True:
+        if pos + batch_size + 1 >= len(tokens):
+            tokens, pos = _load_data_shard(next(file_iter)), 0
+        buf = tokens[pos + dist.get_rank() * local_batch_size:][:local_batch_size + 1]
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
+        pos += batch_size
+        yield inputs.view(-1, seq_len), targets.view(-1, seq_len)
+
+
+########################################
+#             Architecture             #
+########################################
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gains = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return F.rms_norm(x, (x.size(-1),), weight=self.gains.type_as(x))
+
+class Linear(nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=True)
+
+    def forward(self, x):
+        return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        # half-truncate RoPE (w/ base freq tuning)
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        self.register_buffer("angular_freq", torch.cat([angular_freq, angular_freq.new_zeros(dim//4)]))
+
+    def forward(self, x_BTHD: Tensor):
+        pos = torch.arange(x_BTHD.size(1), dtype=torch.float32, device=x_BTHD.device)
+        theta = torch.outer(pos, self.angular_freq)[None, :, None, :]
+        cos, sin = theta.cos(), theta.sin()
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, head_dim=128):
+        super().__init__()
+        self.num_heads = dim // head_dim
+        self.head_dim = head_dim
+        hdim = self.num_heads * self.head_dim
+        self.q = Linear(dim, hdim)
+        self.k = Linear(dim, hdim)
+        self.v = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+        self.rotary = Rotary(head_dim)
+
+    def forward(self, x: Tensor):
+        B, T = x.size(0), x.size(1)
+        q = self.q(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.k(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.v(x).view(B, T, self.num_heads, self.head_dim)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
+        q, k = self.rotary(q), self.rotary(k)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
+                                           v.transpose(1, 2), scale=0.12, is_causal=True).transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+        y = self.proj(y)
+        return y
+
+class MLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.fc = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+
+    def forward(self, x: Tensor):
+        x = self.fc(x)
+        x = x.relu().square()
+        x = self.proj(x)
+        return x
+
+class Block(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.attn = CausalSelfAttention(dim)
+        self.mlp = MLP(dim)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
+
+    def forward(self, x: Tensor):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, model_dim: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
+        self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
+        self.proj = Linear(model_dim, vocab_size)
+        self.norm1 = RMSNorm(model_dim)
+        self.norm2 = RMSNorm(model_dim)
+
+    def forward(self, inputs: Tensor, targets: Tensor):
+        x = self.norm1(self.embed(inputs))
+        for block in self.blocks:
+            x = block(x)
+        logits = self.proj(self.norm2(x)).float()
+        logits = 15 * logits * (logits.square() + 15**2).rsqrt()
+        return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
+
+
+########################################
+#              Optimizer               #
+########################################
+
+def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
+    assert G.ndim >= 2
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    # Perform the NS iterations, not optimizing for wallclock speed
+    a, b, c = 2, -1.5, 0.5
+    for _ in range(12):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+@torch.compile
+def ns_update(N: Tensor) -> Tensor:
+    update = zeropower_via_newtonschulz5(N).float()
+    update *= max(1, N.size(-2) / N.size(-1))**0.5
+    return update
+
+class MuownSOAP(torch.optim.Optimizer):
+    """
+    Muown reparameterization W = Diag(g) R (unit rows R) for hidden matrices.
+      magnitude: g trained by Adam on dL/dg_i = <dW_i, R_i>; rows that start at zero (attn.proj, mlp.proj)
+                 use a zlr-times larger lr_g, since they must grow g from zero
+      direction: O = NS5(whiten(Nesterov(dW))), radial part removed per row, each row of R
+                 rotated by angle ang/(1 + dec*progress) degrees (times the lr schedule) along -O_t/|O_t|,
+                 then renormalized (no weight decay).
+      whitening (SOAP-style, before NS): N = Q_L ((Q_L^T M Q_R) / V^p) Q_R^T, with Q_L, Q_R the
+                 eigenbases of EMA(G G^T), EMA(G^T G) (eigh at init, one power-iteration+QR every `refresh` steps)
+                 and V = EMA((Q_L^T G Q_R)^2).
+      zero-init rows (g = 0): on the first step R is set to -O/|O| for those rows (no rotation that step),
+                 so their direction starts as the first descent direction and Adam grows g from zero.
+    All matrices of the same shape are processed as one batch; every rank computes every update.
+    """
+    def __init__(self, params, train_steps, lr=0.012, ang=4.0, dec=15.0, mu=0.95, betas=(0.8, 0.95),
+                 p=0.3125, beta_s=0.95, beta2=0.95, refresh=10, zlr=2.5):
+        assert isinstance(params, list) and len(params) >= 1
+        shapes = sorted(set(tuple(x.shape) for x in params), reverse=True)
+        groups = [dict(params=[x for x in params if tuple(x.shape) == s]) for s in shapes]
+        defaults = dict(lr=lr, ang=ang, dec=dec, mu=mu, betas=betas, p=p, beta_s=beta_s, beta2=beta2, refresh=refresh, zlr=zlr)
+        super().__init__(groups, defaults)
+        self.train_steps = train_steps
+        self.t = 0
+
+    @torch.no_grad()
+    def _init_group(self, group):
+        params = group["params"]
+        W = torch.stack([x.detach().float() for x in params])
+        gn = W.norm(dim=-1)
+        zero = gn < 1e-12
+        R = torch.where(zero[..., None], torch.zeros_like(W), W / gn.clamp_min(1e-12)[..., None])
+        group["state"] = dict(g=torch.where(zero, torch.zeros_like(gn), gn), R=R, zero=zero,
+                              g_m=torch.zeros_like(gn), g_v=torch.zeros_like(gn),
+                              mom=torch.zeros_like(W), V=torch.zeros_like(W))
+
+    @torch.no_grad()
+    def step(self):
+        self.t += 1
+        progress = (self.t - 1) / self.train_steps
+        for group in self.param_groups:
+            first = "state" not in group
+            if first:
+                self._init_group(group)
+            st = group["state"]
+            params = group["params"]
+            eta = group["lr"] / group["initial_lr"]
+            G = torch.stack([x.grad.float() for x in params])
+            # Nesterov momentum (#36)
+            mom = st["mom"]
+            mom.lerp_(G, 1 - group["mu"])
+            M = G.lerp(mom, group["mu"])
+            # whitening before NS
+            V = st["V"]
+            bs = group["beta_s"]
+            GGt, GtG = G @ G.mT, G.mT @ G
+            if first:
+                st["L"], st["Rf"] = (1 - bs) * GGt, (1 - bs) * GtG
+                def eig_desc(P):
+                    d = P.size(-1)
+                    Pn = P / (P.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30)
+                    _, Q = torch.linalg.eigh(Pn + 1e-6 * torch.eye(d, device=P.device))
+                    return Q.flip(-1).contiguous()
+                st["QL"], st["QR"] = eig_desc(st["L"]), eig_desc(st["Rf"])
+            else:
+                st["L"].lerp_(GGt, 1 - bs)
+                st["Rf"].lerp_(GtG, 1 - bs)
+                if self.t % group["refresh"] == 0:  # batched QR is the dominant cost
+                    st["QL"] = torch.linalg.qr(st["L"] @ st["QL"]).Q
+                    st["QR"] = torch.linalg.qr(st["Rf"] @ st["QR"]).Q
+            QL, QR = st["QL"], st["QR"]
+            V.lerp_((QL.mT @ G @ QR).square(), 1 - group["beta2"])
+            D = V.pow(group["p"])
+            D += 1e-6 * D.mean(dim=(-2, -1), keepdim=True) + 1e-30
+            N = QL @ ((QL.mT @ M @ QR) / D) @ QR.mT
+            O = ns_update(N)
+            R, g = st["R"], st["g"]
+            if first:  # zero-init rows: start along the first descent direction
+                zr = st["zero"][..., None]
+                R.copy_(torch.where(zr, -O / O.norm(dim=-1, keepdim=True).clamp_min(1e-12), R))
+            # magnitude: Adam on g
+            b1, b2 = group["betas"]
+            gg = (G * R).sum(-1)
+            st["g_m"].lerp_(gg, 1 - b1)
+            st["g_v"].lerp_(gg.square(), 1 - b2)
+            mh = st["g_m"] / (1 - b1 ** self.t)
+            vh = st["g_v"] / (1 - b2 ** self.t)
+            lrg = group["lr"] * torch.where(st["zero"], group["zlr"], 1.0)  # zero-init (proj) rows: zlr x lr_g
+            g.sub_(lrg * mh / (vh.sqrt() + 1e-10))
+            # direction: tangential NS output, fixed per-row angle on the sphere
+            Ot = O - (O * R).sum(-1, keepdim=True) * R
+            u = Ot / Ot.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            theta = math.radians(group["ang"] / (1 + group["dec"] * progress)) * eta
+            Rn = R * math.cos(theta) - u * math.sin(theta)
+            Rn = Rn / Rn.norm(dim=-1, keepdim=True)
+            R.copy_(torch.where(zr, R, Rn) if first else Rn)
+            for x, w in zip(params, (g[..., None] * R).unbind(0)):
+                x.copy_(w)
+
+    @torch.no_grad()
+    def lookahead(self, beta, beta_g, beta_gz):
+        """Factor-space EMA-Nesterov lookahead: move (g, R) along the displacement EMAs (mg, mR),
+        with the R move projected onto the row tangent space and renormalized to the row sphere.
+        The gradient is then taken at the lookahead point and step() runs from it."""
+        for group in self.param_groups:
+            if "state" not in group:
+                continue
+            st = group["state"]
+            R, g = st["R"], st["g"]
+            if "mR" not in st:
+                st["mR"], st["mg"] = torch.zeros_like(R), torch.zeros_like(g)
+            st["R_x"], st["g_x"] = R.clone(), g.clone()
+            if beta == 0 and beta_g == 0 and beta_gz == 0:
+                continue
+            mR = st["mR"]
+            T = mR - (mR * R).sum(-1, keepdim=True) * R
+            Rn = R + beta * T
+            R.copy_(Rn / Rn.norm(dim=-1, keepdim=True).clamp_min(1e-12))
+            g.add_(st["mg"] * torch.where(st["zero"], beta_gz, beta_g))
+            for x, w in zip(group["params"], (g[..., None] * R).unbind(0)):
+                x.copy_(w)
+
+    @torch.no_grad()
+    def update_ema(self, gamma):
+        for group in self.param_groups:
+            st = group.get("state")
+            if st is None or "R_x" not in st:
+                continue
+            st["mR"].lerp_(st["R"] - st["R_x"], 1 - gamma)
+            st["mg"].lerp_(st["g"] - st["g_x"], 1 - gamma)
+            del st["R_x"], st["g_x"]
+
+class EMANesterov:
+    """EMA-Nesterov lookahead wrapper (W space) for the AdamW-trained params: before the
+    forward-backward, p <- x + beta * m (tangential params: m projected per row onto the tangent
+    space of x; plain params: scaled beta), after the step m <- EMA(p_new - x)."""
+    def __init__(self, tangential, plain, plain_beta_scale):
+        self.tangential, self.plain, self.plain_beta_scale = list(tangential), list(plain), plain_beta_scale
+        self.m = {p: torch.zeros_like(p, dtype=torch.float32) for p in self.tangential + self.plain}
+        self.x = {}
+
+    @torch.no_grad()
+    def lookahead(self, beta):
+        for p in self.tangential + self.plain:
+            self.x[p] = p.detach().float().clone()
+        if beta == 0:
+            return
+        for p in self.tangential:
+            x, m = self.x[p], self.m[p]
+            coef = (m * x).sum(-1, keepdim=True) / x.square().sum(-1, keepdim=True).clamp_min(1e-30)
+            p.copy_(x + beta * (m - coef * x))
+        for p in self.plain:
+            p.copy_(self.x[p] + self.plain_beta_scale * beta * self.m[p])
+
+    @torch.no_grad()
+    def update_ema(self, gamma):
+        for p, x in self.x.items():
+            self.m[p].lerp_(p.detach().float() - x, 1 - gamma)
+        self.x = {}
+
+
+########################################
+#                Setup                 #
+########################################
+
+# torchrun sets these env variables
+device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+torch.cuda.set_device(device)
+dist.init_process_group(backend="nccl", device_id=device)
+dist.barrier()
+# this code can be run equivalently with 1, 2, 4, or 8 gpus.
+assert 8 % dist.get_world_size() == 0
+
+# logging setup
+if dist.get_rank() == 0:
+    os.makedirs("logs", exist_ok=True)
+    logfile = f"logs/{uuid.uuid4()}.txt"
+    print(logfile)
+def print0(s, console=False, log=True):
+    if dist.get_rank() == 0:
+        if console:
+            print(s)
+        if log:
+            with open(logfile, "a") as f:
+                print(s, file=f)
+
+# we begin by logging this file itself
+print0(code)
+print0("="*100)
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
+       + f" with world_size {dist.get_world_size()}")
+print0("="*100)
+
+val_tokens = 20 * 524288
+batch_size = 8 * 64 * 1024
+mbs = 64
+val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
+
+model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
+model.compile(dynamic=False)
+
+
+num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
+
+for _ in range(num_trials):
+
+
+    ########################################
+    #       Init & Optim Hyperparams       #
+    ########################################
+
+    # we want to minimize this while still reaching 3.28 val loss
+    train_steps = 2590
+
+    # initialize model parameters
+    for name, p in model.named_parameters():
+        w = p.data
+        if name.endswith("weight"):
+            if "proj" in name:
+                w.zero_()
+            elif "embed" in name:
+                w.normal_()  # default torch init
+            else:
+                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
+        elif name.endswith("bias"):
+            w.zero_()
+        elif name.endswith("gains"):
+            w.normal_(mean=1, std=0)
+        else:
+            raise Exception(f"Uninitialized parameter: {name}")
+
+    # create the optimizer(s)
+    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
+                        # head: a longer second-moment horizon than the shared default
+                        dict(params=[model.proj.weight], lr=0.004, betas=(0.8, 0.99)),
+                        dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
+                       betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
+    # hidden-matrix peak lr, retuned for the 2700-step evaluation length (was 0.0084 at 3250)
+    optimizer2 = MuownSOAP([p for p in model.blocks.parameters() if p.ndim >= 2], train_steps,
+                           lr=0.0092, ang=4.0, dec=15.0, p=0.3125, refresh=1, zlr=2.5)
+    optimizers = [optimizer1, optimizer2]
+    assert set(p for opt in optimizers for group in opt.param_groups
+               for p in group["params"]) == set(model.parameters())
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["initial_lr"] = group["lr"]
+
+    # EMA-Nesterov lookahead: factor space for the Muown matrices, W space for the AdamW params
+    hidden_ids = set(id(p) for group in optimizer2.param_groups for p in group["params"])
+    aux = [(n, p) for n, p in model.named_parameters() if id(p) not in hidden_ids]
+    aux_wrapper = EMANesterov([p for n, p in aux if not n.endswith("bias") and n != "embed.weight"],
+                              [p for n, p in aux if n.endswith("bias")], plain_beta_scale=0.85 / 0.7)
+    la_beta, la_beta_g, la_aux_beta, la_gamma = 0.6, 1.2, 0.6, 0.995
+
+    # learning rate schedule: stable then decay
+    def lr_factor(step, cooldown_frac=0.7):
+        progress = step / train_steps
+        assert 0 <= progress < 1
+        if progress < 1 - cooldown_frac:
+            return 1.0
+        return (1 - progress) / cooldown_frac
+
+    # lookahead strength: eta^1.5 inside [0.05T, 0.90T), zero outside, so `model` ends as the plain iterate
+    def lookahead_factor(step):
+        if 0.05 * train_steps <= step < 0.90 * train_steps:
+            return lr_factor(step) ** 1.5
+        return 0.0
+
+    # Tail: instead of annealing eta to zero, hold it at a floor so that descent along the
+    # low-curvature directions continues to the end of the run, and average away the jitter the
+    # floor leaves behind with a single readout at the end. The two only pay together: a floor
+    # alone adds noise, and an average has little left to remove once eta -> 0. The best floor
+    # depends on the run length, so retune it at the target length, not on a shortened run.
+    tail_floor = 0.35       # eta is held at max(tail_floor, lr_factor(step))
+    # Both window constants are derived from the floor rather than chosen independently: the floor
+    # starts binding where lr_factor(step) == tail_floor, i.e. at progress 1 - cooldown_frac *
+    # tail_floor, and the EMA horizon is a quarter of the floored phase that follows. So raising
+    # the floor automatically widens the average, and nothing here is tied to a particular horizon.
+    tail_start = 1.0 - 0.7 * tail_floor        # fraction of train_steps at which the floor binds
+    tail_ema_frac = (1.0 - tail_start) / 4.0   # EMA horizon as a fraction of train_steps
+    tail_blend = 0.85       # weight on the average in the single final readout
+
+    def lr_factor_floored(step):
+        return max(tail_floor, lr_factor(step))
+
+    # the embedding keeps the unfloored schedule; the head, the 1D params and MuownSOAP get the floor
+    _embed_id = id(model.embed.weight)
+    _plain_groups = [g for g in optimizer1.param_groups
+                     if any(id(p) == _embed_id for p in g["params"])]
+    assert len(_plain_groups) == 1
+    _plain_ids = set(id(g) for g in _plain_groups)
+    _floored_groups = [g for opt in optimizers for g in opt.param_groups if id(g) not in _plain_ids]
+
+    def set_hparams(step):
+        eta, eta_f = lr_factor(step), lr_factor_floored(step)
+        for group in _plain_groups:
+            group["lr"] = group["initial_lr"] * eta
+        for group in _floored_groups:
+            group["lr"] = group["initial_lr"] * eta_f
+
+    # tail average: factor space (g, R) for the Muown matrices, W space for the head/gains/biases.
+    # The embedding is left out, as it is also left out of the floor.
+    tail_targets = [p for n, p in aux if n != "embed.weight"]
+    tail_ema = {}
+
+    @torch.no_grad()
+    def tail_accumulate():
+        rate = 1.0 / (tail_ema_frac * train_steps)
+        for i, group in enumerate(optimizer2.param_groups):
+            st = group.get("state")
+            if st is None:
+                continue
+            for key in ("g", "R"):
+                cur, k = st[key], (i, key)
+                if k in tail_ema:
+                    tail_ema[k].lerp_(cur.float(), rate)
+                else:
+                    tail_ema[k] = cur.detach().float().clone()
+        for p in tail_targets:
+            cur = p.detach()
+            if id(p) in tail_ema:
+                tail_ema[id(p)].lerp_(cur.float(), rate)
+            else:
+                tail_ema[id(p)] = cur.float().clone()
+
+    @torch.no_grad()
+    def tail_readout(w):
+        """Blend the tail average into the weights once, in place. No extrapolation, no snapshots."""
+        for i, group in enumerate(optimizer2.param_groups):
+            st = group.get("state")
+            if st is None or (i, "g") not in tail_ema:
+                continue
+            g, R = st["g"], st["R"]
+            g.lerp_(tail_ema[(i, "g")], w)
+            R.lerp_(tail_ema[(i, "R")], w)
+            R.div_(R.norm(dim=-1, keepdim=True).clamp_min(1e-12))
+            for x, wt in zip(group["params"], (g[..., None] * R).unbind(0)):
+                x.copy_(wt)
+        for p in tail_targets:
+            if id(p) in tail_ema:
+                p.detach().lerp_(tail_ema[id(p)].to(p.dtype), w)
+
+
+    ########################################
+    #        Training and Validation       #
+    ########################################
+
+    train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
+    for p in model.parameters():
+        dist.broadcast(p.detach(), 0)
+    # start the clock
+    training_time = 0
+    last_val_step = 0
+    dist.barrier()
+    t0 = time.perf_counter()
+    for step in range(train_steps + 1):
+
+        # once-only tail readout, written into the weights before anything reads them
+        if step == train_steps:
+            tail_readout(tail_blend)
+
+        # --------------- VALIDATION SECTION -----------------
+        val_step_freq = 125 if step / train_steps < 0.9 else 25
+        if step == train_steps or step % val_step_freq == 0:
+            # stop the clock
+            dist.barrier()
+            time_since_last_val = time.perf_counter() - t0
+            step_avg = time_since_last_val / (step - last_val_step) if step > 0 else float("nan")
+            last_val_step = step
+            training_time += time_since_last_val
+            model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                assert len(val_inputs) % mbs == 0
+                for i in range(len(val_inputs) // mbs):
+                    val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+            dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+            val_loss /= val_tokens
+            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f}", console=True)
+            model.train()
+            # start the clock again
+            dist.barrier()
+            t0 = time.perf_counter()
+
+        if step == train_steps:
+            break
+
+        # --------------- TRAINING SECTION -----------------
+        inputs, targets = next(train_loader)
+        bf = lookahead_factor(step)
+        bfz = lr_factor(step) ** 1.5 if step < 0.90 * train_steps else 0.0  # zero-init rows: g push from step 0
+        optimizer2.lookahead(la_beta * bf, la_beta_g * bf, la_beta_g * bfz)
+        aux_wrapper.lookahead(la_aux_beta * bf)
+        # accumulate across microbatches in case we are running with fewer than 8 gpus
+        assert len(inputs) % mbs == 0
+        for i in range(len(inputs) // mbs):
+            model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
+        for name, p in model.named_parameters():
+            assert p.grad is not None, name
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        # set optimization hyperparameters and take a step
+        set_hparams(step)
+        for opt in optimizers:
+            opt.step()
+        optimizer2.update_ema(la_gamma)
+        aux_wrapper.update_ema(la_gamma)
+        if step + 1 >= tail_start * train_steps:  # averages the post-step iterates, not the lookahead point
+            tail_accumulate()
+        model.zero_grad(set_to_none=True)
+        approx_training_time = training_time + (time.perf_counter() - t0)
+        print0(f"step:{step+1}/{train_steps}", console=True, log=False)
+
+dist.destroy_process_group()
+
+====================================================================================================
+Running PyTorch 2.12.0+cu132 compiled for CUDA 13.2 with world_size 1
+====================================================================================================
+step:0/2590 val_loss:10.82583
+step:125/2590 val_loss:4.54795
+step:250/2590 val_loss:4.12610
+step:375/2590 val_loss:3.96896
+step:500/2590 val_loss:3.85611
+step:625/2590 val_loss:3.77905
+step:750/2590 val_loss:3.72737
+step:875/2590 val_loss:3.66843
+step:1000/2590 val_loss:3.61108
+step:1125/2590 val_loss:3.56821
+step:1250/2590 val_loss:3.52330
+step:1375/2590 val_loss:3.48665
+step:1500/2590 val_loss:3.44762
+step:1625/2590 val_loss:3.41763
+step:1750/2590 val_loss:3.38930
+step:1875/2590 val_loss:3.36457
+step:2000/2590 val_loss:3.34408
+step:2125/2590 val_loss:3.32993
+step:2250/2590 val_loss:3.31853
+step:2350/2590 val_loss:3.31137
+step:2375/2590 val_loss:3.30898
+step:2400/2590 val_loss:3.30695
+step:2425/2590 val_loss:3.30566
+step:2450/2590 val_loss:3.30335
+step:2475/2590 val_loss:3.30259
+step:2500/2590 val_loss:3.30112
+step:2525/2590 val_loss:3.30026
+step:2550/2590 val_loss:3.29833
+step:2575/2590 val_loss:3.29652
+step:2590/2590 val_loss:3.27560
