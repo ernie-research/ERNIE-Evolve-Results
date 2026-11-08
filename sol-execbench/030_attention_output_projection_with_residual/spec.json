@@ -1,0 +1,48 @@
+{
+ "languages": [
+  "cuda_cpp",
+  "cutlass"
+ ],
+ "target_hardware": [
+  "B200",
+  "LOCAL"
+ ],
+ "entry_point": "kernel.cu::run",
+ "destination_passing_style": false,
+ "dependencies": [
+  "torch"
+ ],
+ "binding": "torch",
+ "compile_options": {
+  "cuda_cflags": [
+   "-O3",
+   "-DNDEBUG",
+   "--use_fast_math",
+   "--expt-relaxed-constexpr",
+   "-Xptxas",
+   "-O2",
+   "-Xptxas",
+   "-regUsageLevel=8",
+   "-gencode=arch=compute_100a,code=sm_100a",
+   "-DCUTLASS_ENABLE_GDC_FOR_SM100",
+   "-I/root/paddlejob/solx-build/cutlass/include",
+   "-I/root/paddlejob/solx-build/cutlass/tools/util/include"
+  ],
+  "cflags": [
+   "-O3",
+   "-DNDEBUG",
+   "-I/root/paddlejob/solx-build/cutlass/include",
+   "-I/root/paddlejob/solx-build/cutlass/tools/util/include"
+  ],
+  "ld_flags": [
+   "-Wl,--exclude-libs,ALL",
+   "-L/root/paddlejob/solx-build/cuda-13.1.1/lib",
+   "-L/usr/local/cuda/lib64",
+   "-l:libcublasLt_static.a",
+   "-l:libculibos.a",
+   "-lcublas",
+   "-lrt",
+   "-lpthread"
+  ]
+ }
+}

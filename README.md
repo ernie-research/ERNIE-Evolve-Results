@@ -11,6 +11,7 @@ runs that measured it.
 | nanochat autoresearch: 300 s training budget on one GPU, minimize val_bpb | val_bpb **0.8763** | [`nanochat-autoresearch/`](nanochat-autoresearch/) |
 | NanoGPT speedrun track 1: reach 3.28 FineWeb val loss on 8×H100, minimize training time | **38.92 s** (n=18) | [`nanogpt-speedrun/track-1/`](nanogpt-speedrun/track-1/) |
 | NanoGPT speedrun track 3: reach 3.28 FineWeb val loss with fixed data and architecture, minimize steps | **2590 steps** (n=8) | [`nanogpt-speedrun/track-3/`](nanogpt-speedrun/track-3/) |
+| SOL-ExecBench: GPU kernels on NVIDIA B200, maximize each kernel's SOL score | 7 kernels, **0.6669–0.9920** | [`sol-execbench/`](sol-execbench/) |
 
 Each directory's README has the full numbers, the method and the run details. In every log, the code
 the run executed is embedded (or its sha256 recorded), so a log can be checked against the code next to it.
@@ -53,3 +54,19 @@ torchrun --standalone --nproc_per_node=1 records/track_3_optimization/train_gpt_
 
 Run from the repository root of this project so that `../nanogpt-speedrun/...` resolves; the track 3 README
 shows how the logged seeds were set.
+
+### SOL-ExecBench kernels
+
+One NVIDIA B200 and your own copy of SOL-ExecBench (its task definitions and workload data are not
+redistributed here).
+
+```bash
+cd sol-execbench
+python make_solution.py 029_moe_sparse_routing_and_dispatch > solution.json
+python -c "import sys; from sol_execbench.cli import cli; sys.exit(cli())" <workdir> \
+    --solution solution.json -o trace.jsonl   # <workdir> holds that kernel's definition.json + workload.jsonl
+```
+
+The official leaderboard measures with the SM clocks locked at 1500 MHz; unlocked clocks read faster
+and are not comparable. Per-kernel scores and build notes are in `sol-execbench/README.md`.
+

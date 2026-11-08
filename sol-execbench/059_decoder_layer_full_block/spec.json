@@ -1,0 +1,30 @@
+{
+ "languages": [
+  "cuda_cpp"
+ ],
+ "target_hardware": [
+  "B200",
+  "LOCAL"
+ ],
+ "entry_point": "kernel.cu::run",
+ "destination_passing_style": false,
+ "dependencies": [
+  "torch"
+ ],
+ "compile_options": {
+  "cflags": [
+   "-O3"
+  ],
+  "cuda_cflags": [
+   "-O3",
+   "-gencode=arch=compute_100a,code=sm_100a",
+   "--expt-relaxed-constexpr",
+   "--expt-extended-lambda",
+   "-I/root/paddlejob/solx-build/cutlass/include",
+   "-I/root/paddlejob/solx-build/cutlass/tools/util/include"
+  ],
+  "ld_flags": [
+   "-lcuda"
+  ]
+ }
+}

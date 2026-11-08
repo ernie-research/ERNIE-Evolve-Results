@@ -1,0 +1,17 @@
+{
+ "languages": [
+  "triton",
+  "cute_dsl"
+ ],
+ "target_hardware": [
+  "B200",
+  "LOCAL"
+ ],
+ "entry_point": "kernel.py::run",
+ "destination_passing_style": false,
+ "dependencies": [
+  "torch",
+  "triton",
+  "cutlass"
+ ]
+}
